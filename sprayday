@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #                              SprayDay v1.0
 #        Multi-Protocol Credential & Default-Credential Sprayer
-# Author: bmjanet
+# Author: Britton Janet (SVRBCK)
 # Purpose: Spray supplied or curated default credentials across network
 #          services and databases on a single target, using native Kali
 #          tooling (NetExec, mysql, psql).
@@ -21,6 +21,21 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
+
+DRAMATIC_ENTRANCE_BANNER = r"""
+  █████████                                           ██████████                           ██      ██           
+ ███░░░░░███                                         ░░███░░░░███                         ░███    ███           
+░███    ░░░  ████████  ████████   ██████   █████ ████ ░███   ░░███  ██████   █████ ████   ░░░    ░░░      ██    
+░░█████████ ░░███░░███░░███░░███ ░░░░░███ ░░███ ░███  ░███    ░███ ░░░░░███ ░░███ ░███                   ░░     
+ ░░░░░░░░███ ░███ ░███ ░███ ░░░   ███████  ░███ ░███  ░███    ░███  ███████  ░███ ░███                        ██
+ ███    ░███ ░███ ░███ ░███      ███░░███  ░███ ░███  ░███    ███  ███░░███  ░███ ░███                       ░░ 
+░░█████████  ░███████  █████    ░░████████ ░░███████  ██████████  ░░████████ ░░███████         ██      ██ ██  ██
+ ░░░░░░░░░   ░███░░░  ░░░░░      ░░░░░░░░   ░░░░░███ ░░░░░░░░░░    ░░░░░░░░   ░░░░░███        ░░      ██ ░░  ██ 
+             ░███                           ███ ░███                          ███ ░███               ░░     ░░  
+             █████                         ░░██████                          ░░██████                           
+            ░░░░░                           ░░░░░░                            ░░░░░░                            
+"""
+ 
 
 VERSION = "1.0"
 
@@ -79,6 +94,9 @@ DEFAULT_CREDS = {
         ("root", "raspberry"),
         ("admin", "admin"),
         ("mysql", "mysql"),
+        ("mysql", "password"),
+        ("mysql", "123"),
+        ("admin", "password"),
     ],
     "pgsql": [
         ("postgres", ""),
@@ -96,11 +114,9 @@ DEFAULT_CREDS = {
         ("root", "admin"),
         ("root", "password"),
         ("root", "raspberry"),
-        ("pi", "raspberry"),
         ("admin", "admin"),
         ("admin", "password"),
         ("ubuntu", "ubuntu"),
-        ("kali", "kali"),
     ],
     # Thin generic Windows defaults — see NOTE above.
     "smb": [
@@ -312,8 +328,8 @@ def _nxc_line_hit(line):
 DB_TIMEOUT = 8
 
 
+"""Attempt one MySQL login. Returns (success, detail)."""
 def run_mysql(target, user, password):
-    """Attempt one MySQL login. Returns (success, detail)."""
     # mysql takes the password glued to -p with no space.
     pw_arg = f"-p{password}" if password != "" else "-p"
     cmd = [
@@ -339,9 +355,8 @@ def run_mysql(target, user, password):
     err = (proc.stderr or "").strip().splitlines()
     return False, err[-1] if err else f"exit {proc.returncode}"
 
-
+"""Attempt one PostgreSQL login. Returns (success, detail)."""
 def run_psql(target, user, password):
-    """Attempt one PostgreSQL login. Returns (success, detail)."""
     env = dict(os.environ)
     env["PGPASSWORD"] = password
     env["PGCONNECT_TIMEOUT"] = "5"
@@ -374,11 +389,10 @@ def fmt_cred(user, password):
     shown_pw = password if password != "" else "<blank>"
     return f"{user}:{shown_pw}"
 
-
-def spray_pairs(service, target, pairs, cont_flag, nobrute_flag, cont_after_hit):
-    """Spray an explicit list of (user, password) pairs against one service.
+"""Spray an explicit list of (user, password) pairs against one service.
     Used by --default mode, and by manual mode for the DB services. Returns a
     list of hit strings 'user:password'."""
+def spray_pairs(service, target, pairs, cont_flag, nobrute_flag, cont_after_hit):
     backend = BACKEND[service]
     hits = []
     for user, password in pairs:
@@ -492,6 +506,9 @@ def resolve_services(args):
 
 def main():
     args = build_parser().parse_args()
+
+    # Dramatic entrance.
+    print(f"{C.GREEN}{DRAMATIC_ENTRANCE_BANNER}{C.RESET}")
 
     # Mode validation.
     if args.default and (args.user or args.password):
