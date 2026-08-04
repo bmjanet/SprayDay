@@ -501,7 +501,8 @@ def resolve_services(args):
         # Preserve canonical run order.
         return [s for s in SERVICE_NAMES if s in chosen]
     require_inquirerpy()
-    return [s for s in SERVICE_NAMES if s in set(prompt_services())]
+    selected = set(prompt_services())
+    return [s for s in SERVICE_NAMES if s in selected]
 
 
 def main():
